@@ -1,0 +1,130 @@
+version: 0.2
+
+phases:
+  install:
+    commands:
+      - yum install -y jq
+  pre_build:
+    commands:
+      - IMAGE_TAG=$(cat image_tag.txt)
+      - echo "Canary candidate image tag:" "$IMAGE_TAG"
+  build:
+    commands:
+      # One block scalar, not separate command list items — CodeBuild runs
+      # each `commands:` line as its own shell, so state (variables, `set`
+      # options, the reset_weights/check_alarms functions below) wouldn't
+      # survive across lines otherwise. Same lesson already learned the hard
+      # way in infra-plan-buildspec.yml.
+      - |
+        set -e
+
+        set_weights() {
+          local canary_weight="$1"
+          local blue_weight=$((100 - canary_weight))
+          jq -n --arg blue "$BLUE_TG_ARN" --arg canary "$CANARY_TG_ARN" \
+            --argjson bw "$blue_weight" --argjson cw "$canary_weight" \
+            '[{Type:"forward",ForwardConfig:{TargetGroups:[{TargetGroupArn:$blue,Weight:$bw},{TargetGroupArn:$canary,Weight:$cw}]}}]' \
+            > /tmp/default-actions.json
+          aws elbv2 modify-listener --region "$AWS_DEFAULT_REGION" \
+            --listener-arn "$LISTENER_ARN" \
+            --default-actions file:///tmp/default-actions.json
+          echo "Weights set: blue=$blue_weight canary=$canary_weight"
+        }
+
+        check_alarms() {
+          local states
+          states=$(aws cloudwatch describe-alarms --region "$AWS_DEFAULT_REGION" \
+            --alarm-names "$CANARY_5XX_ALARM" "$CANARY_LATENCY_ALARM" \
+            --query "MetricAlarms[].StateValue" --output text)
+          echo "Alarm states: $states"
+          ! echo "$states" | grep -qw "ALARM"
+        }
+
+        # 1. Find the canary instance (by tag, not a hardcoded ID — the ASG
+        # could in principle have replaced it since the last deploy).
+        INSTANCE_ID=$(aws ec2 describe-instances --region "$AWS_DEFAULT_REGION" \
+          --filters "Name=tag:Role,Values=canary" "Name=instance-state-name,Values=running" \
+          --query "Reservations[0].Instances[0].InstanceId" --output text)
+        if [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" == "None" ]; then
+          echo "No running canary instance found — failing canary, Deploy will be skipped"
+          export CANARY_PASSED=false
+          exit 0
+        fi
+        echo "Canary instance: $INSTANCE_ID"
+
+        # 2. Push the candidate build to just that one instance via SSM.
+        # scripts/canary-deploy.sh is the single source of truth for the
+        # actual deploy logic (docker pull/run) — this just relays its
+        # lines into the SSM command payload, prefixed with the IMAGE_TAG
+        # assignment the script itself expects to find already set.
+        SCRIPT_LINES=$(jq -Rs 'split("\n")' scripts/canary-deploy.sh)
+        PARAMS=$(jq -n --arg tag "$IMAGE_TAG" --argjson lines "$SCRIPT_LINES" \
+          '{commands: (["IMAGE_TAG=" + $tag] + $lines)}')
+        COMMAND_ID=$(aws ssm send-command --region "$AWS_DEFAULT_REGION" \
+          --instance-ids "$INSTANCE_ID" --document-name "AWS-RunShellScript" \
+          --parameters "$PARAMS" --query "Command.CommandId" --output text)
+        echo "SSM command: $COMMAND_ID"
+
+        DEPLOY_STATUS="Pending"
+        for i in $(seq 1 30); do
+          sleep 10
+          DEPLOY_STATUS=$(aws ssm get-command-invocation --region "$AWS_DEFAULT_REGION" \
+            --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+            --query "Status" --output text 2>/dev/null || echo "Pending")
+          echo "SSM deploy status: $DEPLOY_STATUS"
+          if [ "$DEPLOY_STATUS" == "Success" ]; then break; fi
+          if [ "$DEPLOY_STATUS" == "Failed" ] || [ "$DEPLOY_STATUS" == "Cancelled" ] || [ "$DEPLOY_STATUS" == "TimedOut" ]; then
+            break
+          fi
+        done
+        if [ "$DEPLOY_STATUS" != "Success" ]; then
+          echo "Canary deploy via SSM did not succeed (status: $DEPLOY_STATUS) — failing canary, Deploy will be skipped"
+          export CANARY_PASSED=false
+          exit 0
+        fi
+
+        # 3. Wait for the canary instance to report healthy in its own
+        # target group before sending it any real traffic.
+        HEALTHY=false
+        for i in $(seq 1 18); do
+          STATE=$(aws elbv2 describe-target-health --region "$AWS_DEFAULT_REGION" \
+            --target-group-arn "$CANARY_TG_ARN" --targets "Id=$INSTANCE_ID" \
+            --query "TargetHealthDescriptions[0].TargetHealth.State" --output text 2>/dev/null || echo "unknown")
+          echo "Canary target health: $STATE"
+          if [ "$STATE" == "healthy" ]; then HEALTHY=true; break; fi
+          sleep 10
+        done
+        if [ "$HEALTHY" != "true" ]; then
+          echo "Canary instance never became healthy — failing canary, Deploy will be skipped"
+          export CANARY_PASSED=false
+          exit 0
+        fi
+
+        # 4. Ramp: raise canary's share of live traffic in steps, checking
+        # both canary alarms between each one.
+        FAILED=false
+        for WEIGHT in 10 30 60; do
+          echo "Ramping to canary=$WEIGHT%..."
+          set_weights "$WEIGHT"
+          sleep 60
+          if ! check_alarms; then
+            echo "Alarm breached at canary=$WEIGHT% — rolling back"
+            FAILED=true
+            break
+          fi
+        done
+
+        # 5. Always return to the 100/0 baseline — canary is a taster, never
+        # a long-term traffic destination, whether this run passed or failed.
+        set_weights 0
+
+        if [ "$FAILED" == "true" ]; then
+          export CANARY_PASSED=false
+        else
+          echo "Canary ramp completed cleanly"
+          export CANARY_PASSED=true
+        fi
+
+env:
+  exported-variables:
+    - CANARY_PASSED

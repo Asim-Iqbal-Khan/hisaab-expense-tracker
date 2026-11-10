@@ -1,0 +1,34 @@
+version: 0.2
+
+phases:
+  install:
+    commands:
+      - echo "Installing Terraform..."
+      - wget -q https://releases.hashicorp.com/terraform/1.15.8/terraform_1.15.8_linux_amd64.zip
+      - unzip -q terraform_1.15.8_linux_amd64.zip -d /usr/local/bin
+  pre_build:
+    commands:
+      # The plan artifact arrives as a secondary source, not merged into
+      # the primary (source_output) checkout — CodePipeline sets
+      # CODEBUILD_SRC_DIR_<artifact-name> for every non-primary input
+      # artifact. Copy the exact planned file into place before init.
+      - echo "Restoring the saved plan from the Plan stage..."
+      - cp "$CODEBUILD_SRC_DIR_plan_output/envs/prod/tfplan" envs/prod/tfplan
+      # Also restore the Lambda zip files the plan references by local
+      # path — a saved plan only stores a hash for data.archive_file
+      # outputs, not the bytes, so terraform apply needs these to
+      # actually exist on disk again in this fresh checkout.
+      - echo "Restoring Lambda build artifacts from the Plan stage..."
+      - mkdir -p modules/messaging/build
+      - cp -r "$CODEBUILD_SRC_DIR_plan_output/modules/messaging/build/." modules/messaging/build/
+      - cd envs/prod
+      - terraform init
+  build:
+    commands:
+      # No -var flags here on purpose: a saved plan file is already fully
+      # resolved. Re-supplying variables (or re-planning) at apply time
+      # isn't just unnecessary, it would defeat the entire point of the
+      # approval step — apply must run exactly the plan that was
+      # reviewed, not a freshly recomputed one.
+      - echo "Applying the approved plan..."
+      - terraform apply tfplan

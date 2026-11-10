@@ -1,0 +1,76 @@
+version: 0.2
+
+phases:
+  install:
+    commands:
+      - echo "Installing Terraform..."
+      - wget -q https://releases.hashicorp.com/terraform/1.15.8/terraform_1.15.8_linux_amd64.zip
+      - unzip -q terraform_1.15.8_linux_amd64.zip -d /usr/local/bin
+  pre_build:
+    commands:
+      # From the repo root (CODEBUILD_SRC_DIR) on purpose, before cd'ing
+      # into envs/prod — ".." from inside envs/prod only reaches envs/,
+      # never modules/ (siblings, not parent/child), so a fmt check run
+      # after the cd below would silently never catch modules/ formatting
+      # issues at all.
+      - terraform fmt -check -recursive .
+      - cd envs/prod
+      - terraform init
+      - terraform validate
+  build:
+    commands:
+      # Holds the running app version steady rather than guessing at one —
+      # Terraform's own image_tag input never decides what code is live;
+      # the Build stage further down this same pipeline does that, via
+      # CODEBUILD_RESOLVED_SOURCE_VERSION (decision D10 — the two stay
+      # conceptually decoupled even sharing one pipeline now). Reads it
+      # back from the *last applied* state, before this run's plan even
+      # happens.
+      - echo "Reading currently-deployed image tag..."
+      - IMAGE_TAG=$(terraform output -raw image_tag)
+      - echo "image_tag=$IMAGE_TAG"
+      # -detailed-exitcode is what lets Approve/Apply skip themselves when
+      # there's nothing to do: 0 = no changes, 1 = real error, 2 = changes
+      # present. Confirmed the hard way that CodeBuild runs each buildspec
+      # command list item as its own separate shell — `set +e` on its own
+      # line has zero effect on the next line's command, since CodeBuild's
+      # agent checks each item's exit code independently regardless of any
+      # shell state from a prior one. Combining the whole sequence into a
+      # single block (one shell, one invocation) is what actually keeps
+      # `set +e` in scope for the terraform plan line.
+      - |
+        set +e
+        terraform plan -detailed-exitcode -var="image_tag=$IMAGE_TAG" -var="db_master_password=$DB_MASTER_PASSWORD" -out=tfplan
+        PLAN_EXIT_CODE=$?
+        set -e
+        if [ "$PLAN_EXIT_CODE" -eq 0 ]; then
+          echo "No infra changes."
+          export PLAN_HAS_CHANGES=false
+        elif [ "$PLAN_EXIT_CODE" -eq 2 ]; then
+          echo "Infra changes present."
+          export PLAN_HAS_CHANGES=true
+        else
+          echo "terraform plan failed (exit code $PLAN_EXIT_CODE)"
+          exit "$PLAN_EXIT_CODE"
+        fi
+
+env:
+  exported-variables:
+    - PLAN_HAS_CHANGES
+
+artifacts:
+  files:
+    - envs/prod/tfplan
+    # A saved plan only stores a hash reference for data.archive_file
+    # outputs (the Lambda zips), not the actual bytes — terraform apply
+    # reads them from local disk again, and the Apply stage is a
+    # completely fresh checkout with no modules/*/build/ directory at all
+    # (gitignored, never committed — it only ever existed transiently in
+    # this container). Confirmed the hard way: apply failed with "open
+    # ../../modules/messaging/build/post_confirmation.zip: no such file
+    # or directory". Publishing the whole directory here so Apply can
+    # restore it rather than regenerate it (regenerating would mean
+    # re-running terraform plan in the Apply stage — extra time, and a
+    # second chance for the local-vs-CI archive hash difference already
+    # seen once today to resurface awkwardly).
+    - modules/messaging/build/**/*
