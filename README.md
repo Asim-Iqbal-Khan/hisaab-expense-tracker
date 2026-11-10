@@ -67,5 +67,3 @@ Other docs: [`docs/hisaab-prd.md`](docs/hisaab-prd.md) (product spec),
 [`docs/codedeploy-troubleshooting.md`](docs/codedeploy-troubleshooting.md) (CodeDeploy
 blue/green gotchas hit along the way).
 
-> Note: account IDs and internal domain names in the Terraform defaults and docs have been
-> replaced with placeholders (`<AWS_ACCOUNT_ID>`, `example.com`) for public sharing.
